@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "babeldoc-jobpack"
+version = "0.1.0"
+description = "Job package export/apply workflow for BabelDOC"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "AGPL-3.0"
+authors = [{ name = "pixelsama" }]
+dependencies = [
+  "BabelDOC>=0.5.23,<0.6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/pixelsama/babeldoc-jobpack"
+Issues = "https://github.com/pixelsama/babeldoc-jobpack/issues"
+
+[project.scripts]
+babeldoc-jobpack = "babeldoc_jobpack.cli:main"
+babeldoc-export-jobs = "babeldoc_jobpack.cli:export_main"
+babeldoc-apply-jobs = "babeldoc_jobpack.cli:apply_main"
+
