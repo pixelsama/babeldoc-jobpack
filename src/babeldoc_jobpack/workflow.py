@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +24,6 @@ from babeldoc.format.pdf.document_il.midend.typesetting import Typesetting
 from babeldoc.format.pdf.document_il.xml_converter import XMLConverter
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.progress_monitor import ProgressMonitor
-
 from . import SCHEMA_VERSION
 from .translators import EchoTranslator
 
@@ -73,15 +73,19 @@ def export_jobs(
     )
     _maybe_init_font_mapper(doc_layout_model, config)
 
-    docs, copied_input_pdf = _prepare_docs_for_jobpack(config)
-    jobs = _extract_jobs(docs, config)
+    with ProgressMonitor(high_level.get_translation_stage(config)) as monitor:
+        config.progress_monitor = monitor
+        docs, copied_input_pdf = _prepare_docs_for_jobpack(config, job_dir)
+        jobs = _extract_jobs(docs, config)
 
     xml_converter = XMLConverter()
     document_xml = job_dir / "document.xml"
+    document_pickle = job_dir / "document.pkl"
     jobs_json = job_dir / "jobs.json"
     manifest_json = job_dir / "manifest.json"
 
     xml_converter.write_xml(docs, str(document_xml))
+    document_pickle.write_bytes(pickle.dumps(docs, protocol=4))
     jobs_json.write_text(
         json.dumps(jobs, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -94,6 +98,7 @@ def export_jobs(
         "lang_out": lang_out,
         "input_pdf": copied_input_pdf.name,
         "document_xml": document_xml.name,
+        "document_pickle": document_pickle.name,
         "jobs_json": jobs_json.name,
         "job_count": len(jobs),
     }
@@ -106,6 +111,7 @@ def export_jobs(
         "job_dir": str(job_dir),
         "manifest": str(manifest_json),
         "document_xml": str(document_xml),
+        "document_pickle": str(document_pickle),
         "jobs_json": str(jobs_json),
         "job_count": len(jobs),
     }
@@ -131,12 +137,15 @@ def apply_jobs(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     input_pdf = job_dir / manifest["input_pdf"]
-    document_xml = job_dir / manifest["document_xml"]
+    document_xml = job_dir / manifest.get("document_xml", "document.xml")
+    document_pickle = job_dir / manifest.get("document_pickle", "document.pkl")
     jobs_json = job_dir / manifest["jobs_json"]
     if not input_pdf.exists():
         raise JobPackError(f"missing input PDF in job pack: {input_pdf}")
-    if not document_xml.exists():
-        raise JobPackError(f"missing document XML in job pack: {document_xml}")
+    if not document_pickle.exists() and not document_xml.exists():
+        raise JobPackError(
+            f"missing document payload in job pack: {document_pickle} or {document_xml}"
+        )
     if not jobs_json.exists():
         raise JobPackError(f"missing jobs.json in job pack: {jobs_json}")
 
@@ -164,68 +173,73 @@ def apply_jobs(
     )
 
     xml_converter = XMLConverter()
-    docs = xml_converter.read_xml(str(document_xml))
-    il_translator = ILTranslator(translator, config)
+    with ProgressMonitor(high_level.get_translation_stage(config)) as monitor:
+        config.progress_monitor = monitor
+        if document_pickle.exists():
+            docs = pickle.loads(document_pickle.read_bytes())
+        else:
+            docs = xml_converter.read_xml(str(document_xml))
+        il_translator = ILTranslator(translator, config)
 
-    missing_job_ids: list[str] = []
-    font_maps_cache: dict[int, tuple[dict[str, Any], dict[int, dict[str, Any]]]] = {}
-    applied = 0
+        missing_job_ids: list[str] = []
+        font_maps_cache: dict[int, tuple[dict[str, Any], dict[int, dict[str, Any]]]] = {}
+        applied = 0
 
-    for job in jobs:
-        job_id = job["id"]
-        translated_text = translations.get(job_id)
-        if translated_text is None:
-            if fail_on_missing:
-                missing_job_ids.append(job_id)
+        for job in jobs:
+            job_id = job["id"]
+            translated_text = translations.get(job_id)
+            if translated_text is None:
+                if fail_on_missing:
+                    missing_job_ids.append(job_id)
+                    continue
+                translated_text = job.get("source_text", "")
+
+            page_index = int(job["page_index"])
+            paragraph_index = int(job["paragraph_index"])
+            try:
+                page = docs.page[page_index]
+                paragraph = page.pdf_paragraph[paragraph_index]
+            except (IndexError, KeyError) as exc:
+                raise JobPackError(
+                    f"job {job_id} points to a missing page/paragraph ({page_index}/{paragraph_index})"
+                ) from exc
+
+            if page_index not in font_maps_cache:
+                font_maps_cache[page_index] = _build_font_maps(page)
+            page_font_map, xobj_font_map = font_maps_cache[page_index]
+
+            tracker = ParagraphTranslateTracker()
+            text, translate_input = il_translator.pre_translate_paragraph(
+                paragraph,
+                tracker,
+                page_font_map,
+                xobj_font_map,
+            )
+            if text is None or translate_input is None:
                 continue
-            translated_text = job.get("source_text", "")
 
-        page_index = int(job["page_index"])
-        paragraph_index = int(job["paragraph_index"])
-        try:
-            page = docs.page[page_index]
-            paragraph = page.pdf_paragraph[paragraph_index]
-        except (IndexError, KeyError) as exc:
+            il_translator.post_translate_paragraph(
+                paragraph,
+                tracker,
+                translate_input,
+                translated_text,
+            )
+            applied += 1
+
+        if missing_job_ids:
             raise JobPackError(
-                f"job {job_id} points to a missing page/paragraph ({page_index}/{paragraph_index})"
-            ) from exc
+                "translations missing for job IDs: " + ", ".join(missing_job_ids[:20])
+            )
 
-        if page_index not in font_maps_cache:
-            font_maps_cache[page_index] = _build_font_maps(page)
-        page_font_map, xobj_font_map = font_maps_cache[page_index]
+        Typesetting(config).typesetting_document(docs)
+        input_doc = pymupdf.open(str(input_pdf))
+        try:
+            mediabox_data = high_level.fix_media_box(input_doc)
+        finally:
+            input_doc.close()
 
-        tracker = ParagraphTranslateTracker()
-        text, translate_input = il_translator.pre_translate_paragraph(
-            paragraph,
-            tracker,
-            page_font_map,
-            xobj_font_map,
-        )
-        if text is None or translate_input is None:
-            continue
-
-        il_translator.post_translate_paragraph(
-            paragraph,
-            tracker,
-            translate_input,
-            translated_text,
-        )
-        applied += 1
-
-    if missing_job_ids:
-        raise JobPackError(
-            "translations missing for job IDs: " + ", ".join(missing_job_ids[:20])
-        )
-
-    Typesetting(config).typesetting_document(docs)
-    input_doc = pymupdf.open(str(input_pdf))
-    try:
-        mediabox_data = high_level.fix_media_box(input_doc)
-    finally:
-        input_doc.close()
-
-    pdf_creater = PDFCreater(str(input_pdf), docs, config, mediabox_data)
-    result = pdf_creater.write(config)
+        pdf_creater = PDFCreater(str(input_pdf), docs, config, mediabox_data)
+        result = pdf_creater.write(config)
 
     outputs = _collect_result_paths(result)
     return {
@@ -272,7 +286,7 @@ def _new_translation_config(
     )
 
 
-def _prepare_docs_for_jobpack(config: TranslationConfig):
+def _prepare_docs_for_jobpack(config: TranslationConfig, job_dir: Path):
     input_pdf = Path(config.input_file).resolve()
     copied_input_pdf = Path(config.get_working_file_path("jobpack_input.pdf"))
     shutil.copy2(input_pdf, copied_input_pdf)
@@ -317,7 +331,7 @@ def _prepare_docs_for_jobpack(config: TranslationConfig):
     StylesAndFormulas(config).process(docs)
     doc_pdf.close()
 
-    final_input_copy = Path(config.working_dir).parent / "input.pdf"
+    final_input_copy = job_dir / "input.pdf"
     shutil.copy2(copied_input_pdf, final_input_copy)
     return docs, final_input_copy
 
@@ -425,4 +439,3 @@ def _collect_result_paths(result) -> list[str]:
             if resolved not in paths:
                 paths.append(resolved)
     return paths
-
